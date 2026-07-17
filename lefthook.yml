@@ -1,0 +1,21 @@
+# Quality gates — enforced automatically via git hooks.
+# Install: lefthook install
+# Prereqs: cargo-deny, cargo-machete (see README "Development").
+
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      run: cargo fmt --all --check
+    clippy:
+      run: cargo clippy --all-targets -- -D warnings
+    test:
+      run: cargo test
+
+pre-push:
+  parallel: true
+  commands:
+    deny:
+      run: cargo deny check licenses advisories sources
+    machete:
+      run: cargo machete --skip-target-dir

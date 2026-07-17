@@ -1,0 +1,55 @@
+[package]
+name = "enki"
+version = "0.1.0"
+edition = "2024"
+description = "Provider-agnostic agentic RAG library in Rust: retrieval-as-tool, hybrid search, citation-grounded answers."
+license = "MIT"
+readme = "README.md"
+keywords = ["rag", "llm", "retrieval", "agent", "search"]
+categories = ["text-processing", "science"]
+authors = ["Michaël DOHR <michael.dohr@horwedge.ch>"]
+# repository = "https://github.com/OWNER/enki"  # TODO: set once published
+
+[features]
+# Default: dense brute-force + a ready-to-use console tracing subscriber.
+default = ["console"]
+# `console`: pull `tracing-subscriber` and expose `telemetry::init_console`,
+# a stderr log/telemetry sink filtered by `ENKI_LOG`. Turn off if the host app
+# installs its own `tracing` subscriber (e.g. a Tauri backend).
+console = ["dep:tracing-subscriber"]
+# `fs`: mmap the on-disk vector matrix instead of loading it into RAM.
+# Fast cold start + low steady-state RAM (e.g. a Tauri desktop app).
+fs = ["dep:memmap2", "dep:bytemuck"]
+# `tantivy`: lexical / BM25 retriever (a second `Modality::Lexical` source fused
+# with dense via RRF). Selected at runtime by `ENKI_LEXICAL=tantivy`.
+tantivy = ["dep:tantivy"]
+# `fastembed`: local cross-encoder reranker (bge-reranker-v2-m3 via ONNX). Second
+# stage that reorders the fused candidates. Selected by `ENKI_RERANK=fastembed`.
+# Pulls onnxruntime — heavy; keep off unless reranking is wanted.
+fastembed = ["dep:fastembed"]
+# Planned backends (compile-time). Runtime selection stays config-driven; the
+# engine resolver errors if config asks for a backend not compiled in.
+#   qdrant  = ["dep:qdrant-client"]  # hybrid dense+sparse backend
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+genai = "0.7.0-beta.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+async-trait = "0.1"
+futures = "0.3"
+tokio-stream = "0.1"
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+tantivy = { version = "0.24", optional = true }
+fastembed = { version = "5", optional = true }
+memmap2 = { version = "0.9", optional = true }
+bytemuck = { version = "1", optional = true }
+
+# Demo producers (examples/) only — kept out of the library's dependencies.
+[dev-dependencies]
+serde_yaml = "0.9"
+regex = "1"
+tempfile = "3"

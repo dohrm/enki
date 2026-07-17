@@ -1,0 +1,108 @@
+[
+  {
+    "id": "srd-fireball-damage",
+    "category": "book",
+    "question": "Combien de dégâts inflige le sort Boule de feu et de quel type ?",
+    "expect_all": ["8d6", "feu"],
+    "note": "Corpus seul : chiffres exacts du SRD (levier BM25 futur)."
+  },
+  {
+    "id": "srd-fireball-save",
+    "category": "book",
+    "question": "Quel jet de sauvegarde permet de résister à une Boule de feu ?",
+    "expect_all": ["dexterite"],
+    "note": "Corpus seul : mécanique précise du sort."
+  },
+  {
+    "id": "srd-critical",
+    "category": "book",
+    "question": "Selon les règles officielles du manuel, comment calcule-t-on les dégâts d'un coup critique ?",
+    "expect_any": ["deux fois", "double"],
+    "note": "Corpus seul : la règle officielle (à opposer au house rule)."
+  },
+  {
+    "id": "camp-tavernier",
+    "category": "instance",
+    "question": "Qui tient la Taverne du Griffon Doré ?",
+    "expect_all": ["bram"],
+    "expect_source": ["griffon"],
+    "note": "Instance seule : fait narratif de campagne."
+  },
+  {
+    "id": "camp-lame-mortsvivants",
+    "category": "instance",
+    "question": "Quel effet la Lame lunaire a-t-elle contre les morts-vivants ?",
+    "expect_all": ["1d6", "radiant"],
+    "expect_source": ["lame"],
+    "note": "Instance seule : propriété d'objet de campagne."
+  },
+  {
+    "id": "cross-lyra-fireball",
+    "category": "cross",
+    "question": "Lyra Murmelune lance Boule de feu. Combien de dégâts inflige-t-elle et quel est le DD du jet de sauvegarde ?",
+    "expect_all": ["8d6", "14"],
+    "note": "Fusion tier : 8d6 vient du corpus (SRD), DD 14 vient de la fiche instance de Lyra."
+  },
+  {
+    "id": "hr-critical",
+    "category": "house-rule",
+    "question": "Dans notre campagne, comment fonctionnent les coups critiques ?",
+    "expect_any": ["maximis", "valeur maximale", "maximaux"],
+    "expect_source": ["regle"],
+    "note": "Axe d'autorité : le house rule (dégâts max) doit primer sur le SRD (double dés)."
+  },
+  {
+    "id": "hr-critical-conflict",
+    "category": "house-rule",
+    "question": "Un joueur affirme qu'un coup critique double les dés de dégâts. Est-ce exact dans cette partie ?",
+    "expect_any": ["maximis", "regle maison", "non"],
+    "note": "Résolution de conflit : le house rule l'emporte sur la règle officielle."
+  },
+  {
+    "id": "hr-repos-long",
+    "category": "house-rule",
+    "question": "Quelles sont les conditions d'un repos long dans cette campagne ?",
+    "expect_any": ["lieu sur", "sanctuaire", "fragile"],
+    "expect_source": ["regle"],
+    "note": "Amendement de campagne d'une mécanique du manuel."
+  },
+  {
+    "id": "hr-fireball-clos",
+    "category": "house-rule",
+    "question": "Y a-t-il une règle spéciale pour la Boule de feu en espace clos dans cette campagne ?",
+    "expect_all": ["1d6"],
+    "expect_any": ["clos", "confine", "supplementaire"],
+    "note": "Amendement d'un sort SRD précis (croise corpus + instance)."
+  },
+  {
+    "id": "scope-seraphine",
+    "category": "scope",
+    "question": "Quel est le véritable secret de Dame Séraphine de Valmont ?",
+    "expect_any": ["necromancien", "ordre du voile"],
+    "expect_source": ["seraphine"],
+    "note": "Contenu gm_only : renvoyé aujourd'hui ; futur Filters.scope le filtrera par rôle."
+  },
+  {
+    "id": "mh-voile-lyra",
+    "category": "multihop",
+    "question": "Pourquoi l'Ordre du Voile s'intéresse-t-il à Lyra Murmelune ?",
+    "expect_any": ["lame lunaire", "lame", "rituel"],
+    "note": "Multi-hop : Ordre convoite la Lame (faction) + Lame liée à Lyra (objet) + Séraphine manipule sa coterie (pnj)."
+  },
+  {
+    "id": "cmp-healers",
+    "category": "compare",
+    "question": "Dans le groupe d'aventuriers, qui peut soigner les blessures et comment ?",
+    "expect_all": ["thorgrim"],
+    "expect_any": ["mot de guerison", "soin des blessures", "lyra"],
+    "expect_source": ["pj"],
+    "note": "Comparaison 2 PJ : Thorgrim (clerc, vrai soigneur) + Lyra (soin arcanique anormal)."
+  },
+  {
+    "id": "neg-space-combat",
+    "category": "negative",
+    "question": "Quelles sont les règles pour le combat en apesanteur dans l'espace ?",
+    "expect_answered": false,
+    "note": "Hors corpus : l'agent doit décliner (coverage.answered = false), pas halluciner."
+  }
+]
