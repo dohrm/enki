@@ -84,6 +84,9 @@ pub struct RetrievalConfig {
     pub sparse_model: String,
     /// Server-side fusion for Qdrant hybrid: `rrf` (default) or `dbsf`.
     pub qdrant_fusion: String,
+    /// Relation-graph backend: `none` (off) or `local` (a `graph.json` under
+    /// `cache_dir`). Enables the `neighbors` / `open` agentic tools.
+    pub graph: String,
 }
 
 impl RetrievalConfig {
@@ -100,6 +103,7 @@ impl RetrievalConfig {
             sparse: env_or("ENKI_SPARSE", "none"),
             sparse_model: env_or("ENKI_SPARSE_MODEL", "bge-m3"),
             qdrant_fusion: env_or("ENKI_QDRANT_FUSION", "rrf"),
+            graph: env_or("ENKI_GRAPH", "none"),
         }
     }
 }

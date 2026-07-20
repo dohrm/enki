@@ -233,7 +233,7 @@ All config is environment-driven (loaded from `.env` if present). See
 `ENKI_TOP_K`,
 `ENKI_MAX_ROUNDS`, `ENKI_BACKEND`, `ENKI_CACHE_DIR`, `ENKI_QDRANT_URL`,
 `ENKI_QDRANT_API_KEY`, `ENKI_SPARSE`, `ENKI_SPARSE_MODEL`, `ENKI_QDRANT_FUSION`,
-`ENKI_LEXICAL`, `ENKI_RERANK`, `ENKI_RERANK_CACHE`, `ENKI_LOG`.
+`ENKI_GRAPH`, `ENKI_LEXICAL`, `ENKI_RERANK`, `ENKI_RERANK_CACHE`, `ENKI_LOG`.
 
 `Config` is **grouped by concern** — `embed`, `llm`, `retrieval`, `agent`,
 `indexing` — so each part of the code (and each consumer) depends only on what it
@@ -323,6 +323,32 @@ BM25 nor reranking improve it here — naive equal-weight RRF even *hurt*. They 
 their place on larger, noisier corpora where the gold passage is retrievable but
 mis-ranked (recall@20 ≫ recall@5). Measure before enabling.
 
+### Relation graph
+
+`ENKI_GRAPH=local` loads a corpus-wide relation graph and exposes two agentic
+tools — `neighbors` (walk typed relations of an entity) and `open` (fetch entities
+by id). It joins the vector store's *content* to a relational *skeleton* by entity
+id, so the agent can answer relational questions ("who belongs to X?") that pure
+similarity can't.
+
+Enki does **not** infer the graph (no LLM extraction). The caller **supplies**
+typed edges — a domain app usually already has them:
+
+```rust
+use enki::graph::Edge;
+library.relate(vec![
+    Edge::new("pnj:lyra", "membre_de", "faction:ordre"),
+    Edge::new("pnj:thorgrim", "membre_de", "faction:ordre"),
+]).await?;
+// then: library.ask("Who are the members of the Order?") → the agent searches,
+// finds the faction, and calls `neighbors` to enumerate its members.
+```
+
+One global graph, transverse to collections/tiers. Traversal is bounded (neighbour
+lookups; multi-hop is the agent's job, not a query language) and gated by the same
+trust/tag filters. Local (`graph.json`) for now; a server backend (Neo4j) can slot
+behind the same traits later. See `examples/graph_demo.rs`.
+
 ### Retrieval eval
 
 `retrieval_eval` scores retrieval in isolation (no LLM): recall@5, recall@20, MRR
@@ -351,7 +377,8 @@ directory. See `SPEC.md` for the manifest format.
 - [x] Pure retrieval eval (recall@k / MRR, LLM-free) + deterministic decoding
 - [x] Agentic-loop robustness (stale/dup guard, no-blank fallback, budget cap)
 - [x] Example producers: manifest (corpus), campaign vault (instance), per-spell SRD (spells)
-- [ ] Outline graph navigation (`open` / `neighbors`)
+- [x] Relation graph — caller-supplied typed edges + `neighbors` / `open` agentic
+  tools (`ENKI_GRAPH=local`); Neo4j backend later, same traits
 - [x] Qdrant store backend — dense retrieval + write (feature `qdrant`, `ENKI_BACKEND`)
 - [x] Qdrant native hybrid — dense + sparse, server-side fusion (`ENKI_SPARSE`); two
   drivers behind `SparseEmbedder`: hashed-TF (zero-dep) + fastembed (bge-m3/SPLADE)

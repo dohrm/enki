@@ -177,6 +177,24 @@ impl SearchEngine {
         );
         Ok(fused)
     }
+
+    /// Fetch chunks by document id across all collections (key access, no query) —
+    /// deduped by `chunk_id` and gated by `filters`. Backs the graph `neighbors` /
+    /// `open` tools. Retrievers that can't fetch by id contribute nothing.
+    pub async fn fetch(&self, doc_ids: &[String], filters: Filters) -> Result<Vec<Scored>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for collection in &self.collections {
+            for retriever in &collection.retrievers {
+                for scored in retriever.fetch(doc_ids).await? {
+                    if filters.allows(&scored.chunk) && seen.insert(scored.chunk.chunk_id.clone()) {
+                        out.push(scored);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -217,5 +235,89 @@ mod tests {
         let list = vec![scored("a", 3.0), scored("b", 2.0), scored("c", 1.0)];
         let out = Rrf::default().fuse(vec![list], 2);
         assert_eq!(out.len(), 2);
+    }
+
+    // --- fetch (by-id) engine plumbing ---
+
+    fn chunk(chunk_id: &str, doc_id: &str, trust: crate::model::TrustStatus) -> Chunk {
+        Chunk {
+            chunk_id: chunk_id.into(),
+            doc_id: doc_id.into(),
+            text: "t".into(),
+            tier: 0,
+            trust,
+            tags: vec![],
+            provenance: Provenance::default(),
+        }
+    }
+
+    /// Returns preloaded chunks whose `doc_id` is requested — enough to exercise
+    /// the engine's cross-retriever dedup + filter gating.
+    struct FetchMock(Vec<Chunk>);
+
+    #[async_trait]
+    impl Retriever for FetchMock {
+        fn modality(&self) -> crate::retrieval::Modality {
+            crate::retrieval::Modality::Dense
+        }
+        async fn retrieve(&self, _q: &Query) -> Result<Vec<Scored>> {
+            Ok(vec![])
+        }
+        async fn fetch(&self, doc_ids: &[String]) -> Result<Vec<Scored>> {
+            Ok(self
+                .0
+                .iter()
+                .filter(|c| doc_ids.iter().any(|id| id == &c.doc_id))
+                .map(|c| Scored {
+                    chunk: c.clone(),
+                    score: 1.0,
+                })
+                .collect())
+        }
+    }
+
+    struct NoEmbed;
+    #[async_trait]
+    impl Embedder for NoEmbed {
+        async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_dedups_across_retrievers_and_gates_on_trust() {
+        use crate::model::TrustStatus;
+        // Same chunk in two retrievers of one collection (dense + lexical would both
+        // hold it) → must appear once. A Draft chunk is filtered by a trust floor.
+        let a = chunk("d1#0", "d1", TrustStatus::Canonical);
+        let draft = chunk("d2#0", "d2", TrustStatus::Draft);
+        let collection = Collection {
+            name: "c".into(),
+            tier: 0,
+            retrievers: vec![
+                Arc::new(FetchMock(vec![a.clone(), draft.clone()])),
+                Arc::new(FetchMock(vec![a.clone()])), // duplicate source
+            ],
+        };
+        let engine = SearchEngine::new(Arc::new(NoEmbed), vec![collection]);
+
+        let all = engine
+            .fetch(&["d1".into(), "d2".into()], Filters::default())
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2, "d1 deduped across the two retrievers");
+
+        let gated = engine
+            .fetch(
+                &["d1".into(), "d2".into()],
+                Filters {
+                    trust_min: Some(TrustStatus::Endorsed),
+                    tags: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(gated.len(), 1, "Draft d2 filtered out by trust floor");
+        assert_eq!(gated[0].chunk.doc_id, "d1");
     }
 }

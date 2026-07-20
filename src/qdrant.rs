@@ -28,8 +28,8 @@ use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
     Condition, CreateCollectionBuilder, DeletePointsBuilder, Distance, Filter, Fusion, Modifier,
     NamedVectors, PointStruct, PrefetchQueryBuilder, Query, QueryPointsBuilder, Range,
-    SparseVectorParamsBuilder, SparseVectorsConfigBuilder, UpsertPointsBuilder, Value, Vector,
-    VectorInput, VectorParamsBuilder, VectorsConfigBuilder,
+    ScrollPointsBuilder, SparseVectorParamsBuilder, SparseVectorsConfigBuilder,
+    UpsertPointsBuilder, Value, Vector, VectorInput, VectorParamsBuilder, VectorsConfigBuilder,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,6 +39,8 @@ const EMBED_BATCH: usize = 16;
 /// Named vectors used in hybrid collections.
 const DENSE: &str = "dense";
 const SPARSE: &str = "sparse";
+/// Cap on points returned by a by-id `fetch` (graph neighbours / open).
+const FETCH_LIMIT: u32 = 512;
 
 /// Connect a Qdrant gRPC client. `api_key` is injected by the caller (Qdrant
 /// Cloud); `None` for a local/unsecured instance.
@@ -365,6 +367,35 @@ impl Retriever for QdrantRetriever {
             None => self.retrieve_dense(q, dense).await,
         }
         .with_context(|| format!("querying Qdrant collection `{}`", self.name))
+    }
+
+    async fn fetch(&self, doc_ids: &[String]) -> Result<Vec<Scored>> {
+        if doc_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conds: Vec<Condition> = doc_ids
+            .iter()
+            .map(|id| Condition::matches("doc_id", id.clone()))
+            .collect();
+        let res = self
+            .client
+            .scroll(
+                ScrollPointsBuilder::new(&self.name)
+                    .filter(Filter::should(conds))
+                    .limit(FETCH_LIMIT)
+                    .with_payload(true),
+            )
+            .await
+            .with_context(|| format!("scrolling Qdrant collection `{}`", self.name))?;
+        Ok(res
+            .result
+            .into_iter()
+            .filter_map(|p| {
+                chunk_from_payload(p.payload)
+                    .ok()
+                    .map(|chunk| Scored { chunk, score: 1.0 })
+            })
+            .collect())
     }
 }
 

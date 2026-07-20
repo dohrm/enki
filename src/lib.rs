@@ -10,6 +10,7 @@
 pub mod agent;
 pub mod config;
 pub mod embed;
+pub mod graph;
 pub mod indexing;
 #[cfg(feature = "tantivy")]
 pub mod lexical;

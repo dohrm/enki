@@ -58,6 +58,14 @@ pub struct Query {
 pub trait Retriever: Send + Sync {
     fn modality(&self) -> Modality;
     async fn retrieve(&self, q: &Query) -> Result<Vec<Scored>>;
+
+    /// Fetch every chunk of the given documents **by id** — key access, not
+    /// similarity (used to turn graph neighbours / handles into passages). The
+    /// returned `score` is not a relevance signal. Default: unsupported (empty);
+    /// content-holding backends override it.
+    async fn fetch(&self, _doc_ids: &[String]) -> Result<Vec<Scored>> {
+        Ok(Vec::new())
+    }
 }
 
 // ---------- Dense brute-force (local profile, zero infra) ----------
@@ -113,6 +121,19 @@ impl Retriever for BruteForce {
         scored.sort_by(|a, b| b.score.total_cmp(&a.score));
         scored.truncate(q.k);
         Ok(scored)
+    }
+
+    async fn fetch(&self, doc_ids: &[String]) -> Result<Vec<Scored>> {
+        let want: std::collections::HashSet<&str> = doc_ids.iter().map(String::as_str).collect();
+        Ok(self
+            .store
+            .rows()
+            .filter(|(chunk, _)| want.contains(chunk.doc_id.as_str()))
+            .map(|(chunk, _)| Scored {
+                chunk: chunk.clone(),
+                score: 1.0,
+            })
+            .collect())
     }
 }
 

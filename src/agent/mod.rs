@@ -12,8 +12,9 @@ mod tools;
 
 use answer::{answer_from_prose, answer_from_tool, empty_answer};
 use gather::gather;
-use tools::{answer_tool, search_tool};
+use tools::{answer_tool, graph_tools, search_tool};
 
+use crate::graph::GraphStore;
 use crate::model::Provenance;
 use crate::registry::Registry;
 use crate::retrieval::Filters;
@@ -39,6 +40,16 @@ fn chat_options() -> ChatOptions {
         .with_temperature(0.0)
         .with_seed(42)
         .with_cache_control(CacheControl::Ephemeral)
+}
+
+/// Tools offered while gathering: `search` always; graph traversal when a relation
+/// graph is loaded.
+fn gather_tools(has_graph: bool) -> Vec<Tool> {
+    let mut tools = vec![search_tool()];
+    if has_graph {
+        tools.extend(graph_tools());
+    }
+    tools
 }
 
 const CLOSING: &str = "Answer now, grounded strictly in the passages already retrieved. \
@@ -95,6 +106,7 @@ pub async fn ask(
     system: &str,
     question: &str,
     engine: &SearchEngine,
+    graph: Option<&Arc<dyn GraphStore>>,
     top_k: usize,
     max_rounds: usize,
     filters: Filters,
@@ -103,13 +115,14 @@ pub async fn ask(
     tracing::info!(target: "enki", question, "ask");
     let mut registry = Registry::default();
     let chat = ChatRequest::from_system(system)
-        .with_tools(vec![search_tool()])
+        .with_tools(gather_tools(graph.is_some()))
         .append_message(ChatMessage::user(question));
     let chat = gather(
         client,
         model,
         chat,
         engine,
+        graph,
         &mut registry,
         top_k,
         max_rounds,
@@ -176,6 +189,7 @@ pub fn stream(
     system: String,
     question: String,
     engine: Arc<SearchEngine>,
+    graph: Option<Arc<dyn GraphStore>>,
     top_k: usize,
     max_rounds: usize,
     filters: Filters,
@@ -183,7 +197,16 @@ pub fn stream(
     let (tx, rx) = mpsc::channel(32);
     tokio::spawn(async move {
         if let Err(e) = stream_inner(
-            &client, &model, &system, &question, &engine, top_k, max_rounds, &filters, &tx,
+            &client,
+            &model,
+            &system,
+            &question,
+            &engine,
+            graph.as_ref(),
+            top_k,
+            max_rounds,
+            &filters,
+            &tx,
         )
         .await
         {
@@ -200,6 +223,7 @@ async fn stream_inner(
     system: &str,
     question: &str,
     engine: &SearchEngine,
+    graph: Option<&Arc<dyn GraphStore>>,
     top_k: usize,
     max_rounds: usize,
     filters: &Filters,
@@ -207,13 +231,14 @@ async fn stream_inner(
 ) -> Result<()> {
     let mut registry = Registry::default();
     let chat = ChatRequest::from_system(system)
-        .with_tools(vec![search_tool()])
+        .with_tools(gather_tools(graph.is_some()))
         .append_message(ChatMessage::user(question));
     let chat = gather(
         client,
         model,
         chat,
         engine,
+        graph,
         &mut registry,
         top_k,
         max_rounds,

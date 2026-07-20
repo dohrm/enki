@@ -12,6 +12,7 @@
 use crate::agent::{self, AgentEvent, Answer};
 use crate::config::Config;
 use crate::embed::{Embedder, GenaiEmbedder};
+use crate::graph::{Edge, GraphIndex, GraphStore, LocalGraph};
 use crate::model::{Document, Scored};
 use crate::prompt;
 use crate::providers;
@@ -36,6 +37,10 @@ pub struct Library {
     max_rounds: usize,
     /// Where `ingest` / `delete` write — the counterpart of the read backend.
     writer: Writer,
+    /// Loaded relation graph (read handle for the `neighbors` / `open` tools).
+    graph: Option<Arc<dyn GraphStore>>,
+    /// How `relate` / `delete` mutate the graph (reopened per write).
+    graph_backend: GraphBackend,
 }
 
 impl Library {
@@ -62,6 +67,9 @@ impl Library {
             engine = engine.with_reranker(reranker);
         }
 
+        let graph_backend = graph_backend(cfg)?;
+        let graph = graph_backend.open_read();
+
         Ok(Self {
             llm: providers::client(
                 &cfg.llm.provider,
@@ -75,6 +83,8 @@ impl Library {
             top_k: cfg.retrieval.top_k,
             max_rounds: cfg.agent.max_rounds,
             writer: writer(cfg, sparse)?,
+            graph,
+            graph_backend,
         })
     }
 
@@ -134,6 +144,7 @@ impl Library {
             &self.system,
             question,
             &self.engine,
+            self.graph.as_ref(),
             self.top_k,
             self.max_rounds,
             filters,
@@ -154,6 +165,7 @@ impl Library {
             self.system.clone(),
             question.to_string(),
             self.engine.clone(),
+            self.graph.clone(),
             self.top_k,
             self.max_rounds,
             filters,
@@ -167,10 +179,24 @@ impl Library {
     }
 
     /// Remove documents (by id) from a collection — the write-side counterpart of
-    /// [`Library::ingest`].
+    /// [`Library::ingest`]. Also drops those nodes (and their edges) from the graph.
     pub async fn delete(&self, collection: &str, doc_ids: &[String]) -> Result<()> {
         let mut store = self.writer.open_index(collection, self.embedder.clone())?;
-        store.delete(doc_ids).await
+        store.delete(doc_ids).await?;
+        if let Some(mut graph) = self.graph_backend.open_write() {
+            graph.delete_nodes(doc_ids).await?;
+        }
+        Ok(())
+    }
+
+    /// Add relations to the corpus-wide graph (idempotent). Edges reference entities
+    /// by id (`doc_id` / `semantic_id`); a target need not be ingested yet. Requires
+    /// `ENKI_GRAPH` set (e.g. `local`). Reopen the library for queries to see them.
+    pub async fn relate(&self, edges: Vec<Edge>) -> Result<()> {
+        match self.graph_backend.open_write() {
+            Some(mut graph) => graph.upsert_edges(edges).await,
+            None => anyhow::bail!("no relation graph configured (set ENKI_GRAPH=local)"),
+        }
     }
 }
 
@@ -220,7 +246,45 @@ impl LibraryBuilder {
             writer: Writer::Local {
                 cache_dir: self.cache_dir,
             },
+            graph: None,
+            graph_backend: GraphBackend::None,
         }
+    }
+}
+
+/// Relation-graph backend selection. Local (a `graph.json`) for now; a server
+/// backend (Neo4j) can join here later, behind the same [`GraphStore`] traits.
+enum GraphBackend {
+    None,
+    Local { cache_dir: PathBuf },
+}
+
+impl GraphBackend {
+    /// Read handle for the agentic graph tools (`None` if graph is off).
+    fn open_read(&self) -> Option<Arc<dyn GraphStore>> {
+        match self {
+            GraphBackend::None => None,
+            GraphBackend::Local { cache_dir } => Some(Arc::new(LocalGraph::open(cache_dir))),
+        }
+    }
+
+    /// Fresh write handle for `relate` / `delete` (`None` if graph is off).
+    fn open_write(&self) -> Option<Box<dyn GraphIndex>> {
+        match self {
+            GraphBackend::None => None,
+            GraphBackend::Local { cache_dir } => Some(Box::new(LocalGraph::open(cache_dir))),
+        }
+    }
+}
+
+/// Resolve the relation-graph backend from config.
+fn graph_backend(cfg: &Config) -> Result<GraphBackend> {
+    match cfg.retrieval.graph.as_str() {
+        "none" | "" => Ok(GraphBackend::None),
+        "local" => Ok(GraphBackend::Local {
+            cache_dir: cfg.retrieval.cache_dir.clone(),
+        }),
+        other => anyhow::bail!("unknown ENKI_GRAPH backend `{other}` (expected `none` or `local`)"),
     }
 }
 
