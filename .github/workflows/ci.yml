@@ -9,7 +9,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
+  # ── Lint ──────────────────────────────────────────────────────────────────
+  # Clippy over every feature and target (examples + tests) so no code path
+  # escapes the lint — fastembed/tantivy included.
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,9 +21,61 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Test
-        run: cargo test
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-features --all-targets -- -D warnings
+
+  # ── Tests ─────────────────────────────────────────────────────────────────
+  # Default features, then every feature (compiles the tantivy/fastembed paths;
+  # no test hits the network). `--no-default-features` proves the lib builds
+  # without the console subscriber (a host app installs its own).
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: test (default)
+        run: cargo test --locked
+      - name: test (all features)
+        run: cargo test --locked --all-features
+      - name: build (no default features)
+        run: cargo build --locked --no-default-features
+
+  # ── Cross-platform build ───────────────────────────────────────────────────
+  # Enki is embedded in a native desktop (Tauri) app on all three OSes, and the
+  # heavy backends (onnxruntime via fastembed) are exactly what must build there.
+  build:
+    name: Build / ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux
+            os: ubuntu-latest
+          - label: macos-arm
+            os: macos-latest
+          - label: windows
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.label }}
+      - name: build (all features)
+        run: cargo build --locked --all-features
+
+  # ── Supply chain ───────────────────────────────────────────────────────────
+  # Licenses, advisories, sources — the same gate lefthook runs on push.
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses advisories sources

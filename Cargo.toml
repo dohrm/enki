@@ -8,7 +8,20 @@ readme = "README.md"
 keywords = ["rag", "llm", "retrieval", "agent", "search"]
 categories = ["text-processing", "science"]
 authors = ["Michaël DOHR <michael.dohr@horwedge.ch>"]
-# repository = "https://github.com/OWNER/enki"  # TODO: set once published
+repository = "https://github.com/dohrm/enki"
+# Ship the library + docs, not the demo corpus (10M of SRD pages), the CI/dev
+# tooling, or local caches. Keeps the crates.io tarball small and relevant.
+exclude = [
+    "examples/ressources",
+    "data",
+    ".cache",
+    ".cache-*",
+    ".github",
+    "SPEC.md",
+    "deny.toml",
+    "lefthook.yml",
+    ".env.example",
+]
 
 [features]
 # Default: dense brute-force + a ready-to-use console tracing subscriber.
