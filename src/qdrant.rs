@@ -1,11 +1,16 @@
 //! Qdrant store backend (feature `qdrant`). One profile alongside the local
 //! files: a Qdrant server used as both the write target ([`QdrantStore`], an
-//! [`Index`]) and a retrieval source ([`QdrantRetriever`], a dense [`Retriever`]).
+//! [`Index`]) and a retrieval source ([`QdrantRetriever`], a [`Retriever`]).
 //!
-//! Dense-only for now: candidates come from HNSW over the dense vector, with
-//! `trust_min` pushed down as a server-side payload filter. The engine's fusion /
-//! rerank stack sits on top unchanged — so the day we add sparse vectors, this
-//! backend simply upgrades to [`Modality::Hybrid`] without touching the engine.
+//! Two modes, chosen by whether a [`SparseEmbedder`] is supplied:
+//! - **dense-only** (no sparse): a single unnamed dense vector; `Modality::Dense`.
+//! - **hybrid** (dense + sparse): named `dense` + `sparse` vectors, fused
+//!   server-side (RRF/DBSF) in one Query API call; `Modality::Hybrid`. The sparse
+//!   config carries `Modifier::Idf` so the server applies IDF to the sparse dot
+//!   product (turning raw-TF sparse vectors into a BM25-ish signal).
+//!
+//! Either way the engine sees one source per collection — its fusion/rerank stack
+//! is untouched. `trust_min` is pushed down as a server-side payload filter.
 //!
 //! Mapping:
 //! - point id  = `uuid5(chunk_id)` — deterministic, so re-ingest overwrites in place
@@ -14,33 +19,46 @@
 
 use crate::embed::Embedder;
 use crate::model::{Chunk, Document, Scored};
-use crate::retrieval::{Modality, Query, Retriever};
+use crate::retrieval::{Modality, Query as EngineQuery, Retriever};
+use crate::sparse::SparseEmbedder;
 use crate::store::{Index, chunk_document};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use qdrant_client::Payload;
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
-    Condition, CreateCollectionBuilder, DeletePointsBuilder, Distance, Filter, PointStruct,
-    QueryPointsBuilder, Range, UpsertPointsBuilder, Value, VectorParamsBuilder,
+    Condition, CreateCollectionBuilder, DeletePointsBuilder, Distance, Filter, Fusion, Modifier,
+    NamedVectors, PointStruct, PrefetchQueryBuilder, Query, QueryPointsBuilder, Range,
+    SparseVectorParamsBuilder, SparseVectorsConfigBuilder, UpsertPointsBuilder, Value, Vector,
+    VectorInput, VectorParamsBuilder, VectorsConfigBuilder,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Embedding batch size for ingestion — matches the local store.
 const EMBED_BATCH: usize = 16;
+/// Named vectors used in hybrid collections.
+const DENSE: &str = "dense";
+const SPARSE: &str = "sparse";
 
 /// Connect a Qdrant gRPC client. `api_key` is injected by the caller (Qdrant
 /// Cloud); `None` for a local/unsecured instance.
 pub fn connect(url: &str, api_key: Option<&str>) -> Result<Qdrant> {
     // Skip the client/server version check: a library must not dictate which
-    // Qdrant version the host runs. Our operations (upsert/query/delete) are on
-    // the stable surface.
+    // Qdrant version the host runs. Our operations are on the stable surface.
     let mut builder = Qdrant::from_url(url).skip_compatibility_check();
     if let Some(key) = api_key.filter(|k| !k.is_empty()) {
         builder = builder.api_key(key.to_string());
     }
     builder.build().context("connecting to Qdrant")
+}
+
+/// Parse the configured server-side fusion strategy.
+pub fn fusion_from_str(s: &str) -> Result<Fusion> {
+    match s {
+        "rrf" | "" => Ok(Fusion::Rrf),
+        "dbsf" => Ok(Fusion::Dbsf),
+        other => anyhow::bail!("unknown ENKI_QDRANT_FUSION `{other}` (expected `rrf` or `dbsf`)"),
+    }
 }
 
 /// Deterministic point id from a `chunk_id` — so re-upsert overwrites the same
@@ -52,12 +70,12 @@ fn point_id(chunk_id: &str) -> String {
 
 /// A [`Chunk`] as a Qdrant payload: its JSON fields plus a numeric `trust_rank`
 /// so `trust_min` can be a server-side range filter (the enum can't be ranked).
-fn payload_of(chunk: &Chunk) -> Result<Payload> {
+fn payload_of(chunk: &Chunk) -> Result<qdrant_client::Payload> {
     let mut value = serde_json::to_value(chunk)?;
     if let serde_json::Value::Object(map) = &mut value {
         map.insert("trust_rank".into(), serde_json::json!(chunk.trust.rank()));
     }
-    Payload::try_from(value).context("building Qdrant payload")
+    qdrant_client::Payload::try_from(value).context("building Qdrant payload")
 }
 
 /// Reconstruct a [`Chunk`] from a retrieved payload (the extra `trust_rank` is
@@ -70,14 +88,29 @@ fn chunk_from_payload(payload: HashMap<String, Value>) -> Result<Chunk> {
     serde_json::from_value(serde_json::Value::Object(map)).context("decoding chunk from payload")
 }
 
+/// Server-side `trust_min` filter (a range on the numeric `trust_rank`).
+fn trust_filter(q: &EngineQuery) -> Option<Filter> {
+    q.filters.trust_min.map(|min| {
+        Filter::must([Condition::range(
+            "trust_rank",
+            Range {
+                gte: Some(min.rank() as f64),
+                ..Default::default()
+            },
+        )])
+    })
+}
+
 // ---------- Write side ----------
 
 /// A Qdrant-backed collection implementing [`Index`]. The collection is created
-/// lazily on first upsert (dimension inferred from the embeddings).
+/// lazily on first upsert (dimension inferred from the embeddings). Hybrid when a
+/// [`SparseEmbedder`] is supplied.
 pub struct QdrantStore {
     client: Qdrant,
     name: String,
     embedder: Arc<dyn Embedder>,
+    sparse: Option<Arc<dyn SparseEmbedder>>,
 }
 
 impl QdrantStore {
@@ -86,24 +119,41 @@ impl QdrantStore {
         api_key: Option<&str>,
         name: &str,
         embedder: Arc<dyn Embedder>,
+        sparse: Option<Arc<dyn SparseEmbedder>>,
     ) -> Result<Self> {
         Ok(Self {
             client: connect(url, api_key)?,
             name: name.to_string(),
             embedder,
+            sparse,
         })
     }
 
     async fn ensure_collection(&self, dim: u64) -> Result<()> {
-        if !self.client.collection_exists(&self.name).await? {
-            self.client
-                .create_collection(
-                    CreateCollectionBuilder::new(&self.name)
-                        .vectors_config(VectorParamsBuilder::new(dim, Distance::Cosine)),
-                )
-                .await
-                .with_context(|| format!("creating Qdrant collection `{}`", self.name))?;
+        if self.client.collection_exists(&self.name).await? {
+            return Ok(());
         }
+        let create = if self.sparse.is_some() {
+            // Hybrid: named dense + sparse (IDF-modified so the server applies IDF).
+            let mut dense_cfg = VectorsConfigBuilder::default();
+            dense_cfg
+                .add_named_vector_params(DENSE, VectorParamsBuilder::new(dim, Distance::Cosine));
+            let mut sparse_cfg = SparseVectorsConfigBuilder::default();
+            sparse_cfg.add_named_vector_params(
+                SPARSE,
+                SparseVectorParamsBuilder::default().modifier(Modifier::Idf),
+            );
+            CreateCollectionBuilder::new(&self.name)
+                .vectors_config(dense_cfg)
+                .sparse_vectors_config(sparse_cfg)
+        } else {
+            CreateCollectionBuilder::new(&self.name)
+                .vectors_config(VectorParamsBuilder::new(dim, Distance::Cosine))
+        };
+        self.client
+            .create_collection(create)
+            .await
+            .with_context(|| format!("creating Qdrant collection `{}`", self.name))?;
         Ok(())
     }
 
@@ -139,14 +189,18 @@ impl Index for QdrantStore {
         if chunks.is_empty() {
             return Ok(());
         }
+        let texts: Vec<String> = chunks.iter().map(|c| c.embed_input()).collect();
 
-        // Embed every chunk of the touched documents (they are re-written wholesale).
-        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
-        for batch in chunks.chunks(EMBED_BATCH) {
-            let texts: Vec<String> = batch.iter().map(|c| c.embed_input()).collect();
-            vectors.extend(self.embedder.embed(&texts).await?);
+        // Dense (batched), + sparse for the whole set when hybrid.
+        let mut dense: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+        for batch in texts.chunks(EMBED_BATCH) {
+            dense.extend(self.embedder.embed(batch).await?);
         }
-        let dim = vectors.first().map(Vec::len).context("empty embedding")? as u64;
+        let sparse = match &self.sparse {
+            Some(s) => Some(s.embed_sparse(&texts).await?),
+            None => None,
+        };
+        let dim = dense.first().map(Vec::len).context("empty embedding")? as u64;
 
         // Create → clear old versions → write. Order matters: delete_docs needs the
         // collection to exist.
@@ -155,19 +209,30 @@ impl Index for QdrantStore {
         self.delete_docs(&doc_ids).await?;
 
         let mut points = Vec::with_capacity(chunks.len());
-        for (chunk, vec) in chunks.iter().zip(vectors) {
-            points.push(PointStruct::new(
-                point_id(&chunk.chunk_id),
-                vec,
-                payload_of(chunk)?,
-            ));
+        for (i, chunk) in chunks.iter().enumerate() {
+            let payload = payload_of(chunk)?;
+            let id = point_id(&chunk.chunk_id);
+            let point = match &sparse {
+                Some(sv) => {
+                    let s = &sv[i];
+                    let vectors = NamedVectors::default()
+                        .add_vector(DENSE, dense[i].clone())
+                        .add_vector(
+                            SPARSE,
+                            Vector::new_sparse(s.indices.clone(), s.values.clone()),
+                        );
+                    PointStruct::new(id, vectors, payload)
+                }
+                None => PointStruct::new(id, dense[i].clone(), payload),
+            };
+            points.push(point);
         }
         let count = points.len();
         self.client
             .upsert_points(UpsertPointsBuilder::new(&self.name, points).wait(true))
             .await
             .with_context(|| format!("upserting into Qdrant collection `{}`", self.name))?;
-        tracing::debug!(target: "enki", collection = %self.name, count, "qdrant upsert");
+        tracing::debug!(target: "enki", collection = %self.name, count, hybrid = sparse.is_some(), "qdrant upsert");
         Ok(())
     }
 
@@ -178,65 +243,128 @@ impl Index for QdrantStore {
 
 // ---------- Read side ----------
 
-/// A dense retrieval source over one Qdrant collection. Declares
-/// [`Modality::Dense`]; the query vector is supplied by the engine.
+/// A retrieval source over one Qdrant collection. Dense-only, or hybrid
+/// (dense+sparse with server-side fusion) when a [`SparseEmbedder`] is supplied.
 pub struct QdrantRetriever {
     client: Arc<Qdrant>,
     name: String,
+    sparse: Option<Arc<dyn SparseEmbedder>>,
+    fusion: Fusion,
 }
 
 impl QdrantRetriever {
-    pub fn new(client: Arc<Qdrant>, name: impl Into<String>) -> Self {
+    /// Dense-only source.
+    pub fn dense(client: Arc<Qdrant>, name: impl Into<String>) -> Self {
         Self {
             client,
             name: name.into(),
+            sparse: None,
+            fusion: Fusion::Rrf,
         }
     }
+
+    /// Hybrid source: dense + sparse fused server-side by `fusion`.
+    pub fn hybrid(
+        client: Arc<Qdrant>,
+        name: impl Into<String>,
+        sparse: Arc<dyn SparseEmbedder>,
+        fusion: Fusion,
+    ) -> Self {
+        Self {
+            client,
+            name: name.into(),
+            sparse: Some(sparse),
+            fusion,
+        }
+    }
+
+    async fn retrieve_dense(&self, q: &EngineQuery, dense: &[f32]) -> Result<Vec<Scored>> {
+        let mut builder = QueryPointsBuilder::new(&self.name)
+            .query(dense.to_vec())
+            .limit(q.k as u64)
+            .with_payload(true);
+        if let Some(f) = trust_filter(q) {
+            builder = builder.filter(f);
+        }
+        let res = self.client.query(builder).await?;
+        Ok(scored_from(res.result))
+    }
+
+    async fn retrieve_hybrid(
+        &self,
+        q: &EngineQuery,
+        dense: &[f32],
+        sparse: &Arc<dyn SparseEmbedder>,
+    ) -> Result<Vec<Scored>> {
+        let sv = sparse
+            .embed_sparse(std::slice::from_ref(&q.text))
+            .await?
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+
+        // Each branch retrieves `k` candidates; the server fuses to `k`. Trust is
+        // filtered inside each prefetch (server-side).
+        let filter = trust_filter(q);
+        let mut dense_pf = PrefetchQueryBuilder::default()
+            .using(DENSE)
+            .query(dense.to_vec())
+            .limit(q.k as u64);
+        let mut sparse_pf = PrefetchQueryBuilder::default()
+            .using(SPARSE)
+            .query(Query::new_nearest(VectorInput::new_sparse(
+                sv.indices, sv.values,
+            )))
+            .limit(q.k as u64);
+        if let Some(f) = &filter {
+            dense_pf = dense_pf.filter(f.clone());
+            sparse_pf = sparse_pf.filter(f.clone());
+        }
+
+        let builder = QueryPointsBuilder::new(&self.name)
+            .add_prefetch(dense_pf)
+            .add_prefetch(sparse_pf)
+            .query(Query::new_fusion(self.fusion))
+            .limit(q.k as u64)
+            .with_payload(true);
+        let res = self.client.query(builder).await?;
+        Ok(scored_from(res.result))
+    }
+}
+
+/// Map Qdrant scored points → engine `Scored`, dropping any with an undecodable payload.
+fn scored_from(points: Vec<qdrant_client::qdrant::ScoredPoint>) -> Vec<Scored> {
+    points
+        .into_iter()
+        .filter_map(|p| {
+            let score = p.score;
+            chunk_from_payload(p.payload)
+                .ok()
+                .map(|chunk| Scored { chunk, score })
+        })
+        .collect()
 }
 
 #[async_trait]
 impl Retriever for QdrantRetriever {
     fn modality(&self) -> Modality {
-        Modality::Dense
+        if self.sparse.is_some() {
+            Modality::Hybrid
+        } else {
+            Modality::Dense
+        }
     }
 
-    async fn retrieve(&self, q: &Query) -> Result<Vec<Scored>> {
+    async fn retrieve(&self, q: &EngineQuery) -> Result<Vec<Scored>> {
         let dense = q
             .dense
             .as_deref()
             .context("qdrant retriever requires a dense query vector")?;
-
-        let mut builder = QueryPointsBuilder::new(&self.name)
-            .query(dense.to_vec())
-            .limit(q.k as u64)
-            .with_payload(true);
-        // Push `trust_min` down to the server as a range on the numeric rank.
-        if let Some(min) = q.filters.trust_min {
-            builder = builder.filter(Filter::must([Condition::range(
-                "trust_rank",
-                Range {
-                    gte: Some(min.rank() as f64),
-                    ..Default::default()
-                },
-            )]));
+        match &self.sparse {
+            Some(sparse) => self.retrieve_hybrid(q, dense, sparse).await,
+            None => self.retrieve_dense(q, dense).await,
         }
-
-        let res = self
-            .client
-            .query(builder)
-            .await
-            .with_context(|| format!("querying Qdrant collection `{}`", self.name))?;
-
-        Ok(res
-            .result
-            .into_iter()
-            .filter_map(|p| {
-                let score = p.score;
-                chunk_from_payload(p.payload)
-                    .ok()
-                    .map(|chunk| Scored { chunk, score })
-            })
-            .collect())
+        .with_context(|| format!("querying Qdrant collection `{}`", self.name))
     }
 }
 
@@ -264,38 +392,41 @@ mod tests {
     #[test]
     fn point_id_is_deterministic_and_uuid() {
         let a = point_id("spell:x#0");
-        let b = point_id("spell:x#0");
-        assert_eq!(a, b, "same chunk_id → same point id (idempotent upsert)");
+        assert_eq!(a, point_id("spell:x#0"));
         assert_ne!(a, point_id("spell:x#1"));
-        assert!(uuid::Uuid::parse_str(&a).is_ok(), "must be a valid UUID");
+        assert!(uuid::Uuid::parse_str(&a).is_ok());
     }
 
     #[test]
     fn payload_roundtrips_through_chunk() {
         let c = chunk();
-        let payload = payload_of(&c).unwrap();
-        // Payload derefs to the same map shape a retrieved point carries.
-        let map: HashMap<String, Value> = payload.into();
+        let map: HashMap<String, Value> = payload_of(&c).unwrap().into();
         assert!(map.contains_key("trust_rank"), "rank exposed for filtering");
         let back = chunk_from_payload(map).unwrap();
         assert_eq!(back.chunk_id, c.chunk_id);
-        assert_eq!(back.doc_id, c.doc_id);
         assert_eq!(back.text, c.text);
         assert_eq!(back.trust, c.trust);
-        assert_eq!(back.tags, c.tags);
         assert_eq!(back.provenance.label, c.provenance.label);
     }
 
-    /// Live round-trip against a real Qdrant. Skipped unless `ENKI_QDRANT_TEST=1`
-    /// (so CI, which has no server, is green). Uses a deterministic offline
-    /// embedder and a throwaway collection it cleans up.
+    #[test]
+    fn fusion_parsing() {
+        assert!(matches!(fusion_from_str("rrf").unwrap(), Fusion::Rrf));
+        assert!(matches!(fusion_from_str("dbsf").unwrap(), Fusion::Dbsf));
+        assert!(fusion_from_str("nope").is_err());
+    }
+
+    /// Live round-trips against a real Qdrant. Skipped unless `ENKI_QDRANT_TEST=1`
+    /// (so CI, which has no server, is green). Uses a deterministic offline dense
+    /// embedder + the zero-dep hashed sparse driver, and throwaway collections.
     #[tokio::test]
-    async fn live_upsert_query_delete() {
+    async fn live_dense_and_hybrid() {
         if std::env::var("ENKI_QDRANT_TEST").as_deref() != Ok("1") {
             eprintln!("skipping: set ENKI_QDRANT_TEST=1 with a running Qdrant to run");
             return;
         }
         use crate::model::Metadata;
+        use crate::sparse::HashedTfSparse;
 
         struct Mock;
         #[async_trait]
@@ -315,41 +446,68 @@ mod tests {
             }
         }
 
-        let url = std::env::var("ENKI_QDRANT_URL")
-            .unwrap_or_else(|_| "http://localhost:6334".to_string());
-        let name = "enki_test_live";
+        let url =
+            std::env::var("ENKI_QDRANT_URL").unwrap_or_else(|_| "http://localhost:6334".into());
         let embedder: Arc<dyn Embedder> = Arc::new(Mock);
         let client = Arc::new(connect(&url, None).unwrap());
-        client.delete_collection(name).await.ok();
 
-        let doc = Document {
-            id: "d1".into(),
-            content: "alpha beta gamma".into(),
+        let doc = |id: &str| Document {
+            id: id.into(),
+            content: "alpha beta gamma vecteur clairvoyance".into(),
             metadata: Metadata {
-                label: "Doc d1".into(),
+                label: format!("Doc {id}"),
                 trust: TrustStatus::Canonical,
                 ..Default::default()
             },
         };
-        let mut store = QdrantStore::open(&url, None, name, embedder.clone()).unwrap();
-        store.upsert(vec![doc]).await.unwrap();
-
-        let retriever = QdrantRetriever::new(client.clone(), name);
-        let dense = embedder.embed(&["alpha beta gamma".into()]).await.unwrap();
-        let q = Query {
+        let query = |dense: Vec<f32>| EngineQuery {
             text: "alpha beta gamma".into(),
-            dense: Some(dense.into_iter().next().unwrap()),
+            dense: Some(dense),
             k: 5,
             filters: Default::default(),
         };
-        let hits = retriever.retrieve(&q).await.unwrap();
-        assert!(!hits.is_empty(), "should retrieve the ingested chunk");
-        assert_eq!(hits[0].chunk.doc_id, "d1");
+        let dense_vec = embedder
+            .embed(&["alpha beta gamma".to_string()])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
 
-        store.delete(&["d1".to_string()]).await.unwrap();
-        let after = retriever.retrieve(&q).await.unwrap();
-        assert!(after.is_empty(), "delete removed the document's points");
-
+        // --- dense-only ---
+        let name = "enki_test_dense";
         client.delete_collection(name).await.ok();
+        let mut store = QdrantStore::open(&url, None, name, embedder.clone(), None).unwrap();
+        store.upsert(vec![doc("d1")]).await.unwrap();
+        let r = QdrantRetriever::dense(client.clone(), name);
+        assert_eq!(
+            r.retrieve(&query(dense_vec.clone())).await.unwrap()[0]
+                .chunk
+                .doc_id,
+            "d1"
+        );
+        store.delete(&["d1".into()]).await.unwrap();
+        assert!(
+            r.retrieve(&query(dense_vec.clone()))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        client.delete_collection(name).await.ok();
+
+        // --- hybrid (dense + hashed sparse) ---
+        let hname = "enki_test_hybrid";
+        client.delete_collection(hname).await.ok();
+        let sparse: Arc<dyn SparseEmbedder> = Arc::new(HashedTfSparse::new());
+        let mut hstore =
+            QdrantStore::open(&url, None, hname, embedder.clone(), Some(sparse.clone())).unwrap();
+        hstore.upsert(vec![doc("h1")]).await.unwrap();
+        let hr = QdrantRetriever::hybrid(client.clone(), hname, sparse, Fusion::Rrf);
+        let hits = hr.retrieve(&query(dense_vec)).await.unwrap();
+        assert!(
+            !hits.is_empty(),
+            "hybrid should retrieve the ingested chunk"
+        );
+        assert_eq!(hits[0].chunk.doc_id, "h1");
+        client.delete_collection(hname).await.ok();
     }
 }

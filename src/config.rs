@@ -75,6 +75,15 @@ pub struct RetrievalConfig {
     /// Optional Qdrant API key, injected by the caller (Qdrant Cloud). `None` for
     /// a local/unsecured instance.
     pub qdrant_api_key: Option<String>,
+    /// Sparse (lexical) driver for a Qdrant hybrid collection: `none` (dense-only),
+    /// `hashed` (zero-dep TF, always available) or `fastembed` (learned sparse,
+    /// needs the `fastembed` feature). Qdrant-only.
+    pub sparse: String,
+    /// Sparse model for `sparse = fastembed`: `bge-m3` (multilingual, default) or
+    /// `splade` (English). Ignored otherwise.
+    pub sparse_model: String,
+    /// Server-side fusion for Qdrant hybrid: `rrf` (default) or `dbsf`.
+    pub qdrant_fusion: String,
 }
 
 impl RetrievalConfig {
@@ -88,6 +97,9 @@ impl RetrievalConfig {
             rerank_cache: env_opt("ENKI_RERANK_CACHE").map(Into::into),
             qdrant_url: env_or("ENKI_QDRANT_URL", "http://localhost:6334"),
             qdrant_api_key: env_opt("ENKI_QDRANT_API_KEY"),
+            sparse: env_or("ENKI_SPARSE", "none"),
+            sparse_model: env_or("ENKI_SPARSE_MODEL", "bge-m3"),
+            qdrant_fusion: env_or("ENKI_QDRANT_FUSION", "rrf"),
         }
     }
 }

@@ -24,5 +24,6 @@ pub mod registry;
 pub mod rerank;
 pub mod retrieval;
 pub mod search;
+pub mod sparse;
 pub mod store;
 pub mod telemetry;

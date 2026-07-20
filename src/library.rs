@@ -17,6 +17,7 @@ use crate::prompt;
 use crate::providers;
 use crate::retrieval::{BruteForce, Filters, Retriever};
 use crate::search::{Collection, Reranker, SearchEngine};
+use crate::sparse::SparseEmbedder;
 use crate::store::{Index, LocalStore, VectorStore};
 use anyhow::Result;
 use futures::Stream;
@@ -53,7 +54,9 @@ impl Library {
             cfg.embed.model.clone(),
         ));
 
-        let collections = build_collections(cfg).await?;
+        // Sparse driver (Qdrant hybrid only); shared by the read + write paths.
+        let sparse = sparse_embedder(cfg)?;
+        let collections = build_collections(cfg, sparse.clone()).await?;
         let mut engine = SearchEngine::new(embedder.clone(), collections);
         if let Some(reranker) = reranker(cfg)? {
             engine = engine.with_reranker(reranker);
@@ -71,7 +74,7 @@ impl Library {
             embedder,
             top_k: cfg.retrieval.top_k,
             max_rounds: cfg.agent.max_rounds,
-            writer: writer(cfg)?,
+            writer: writer(cfg, sparse)?,
         })
     }
 
@@ -233,6 +236,8 @@ enum Writer {
     Qdrant {
         url: String,
         api_key: Option<String>,
+        /// Sparse driver for hybrid writes; `None` = dense-only.
+        sparse: Option<Arc<dyn SparseEmbedder>>,
     },
 }
 
@@ -243,19 +248,25 @@ impl Writer {
                 Ok(Box::new(LocalStore::open(cache_dir, name, embedder)))
             }
             #[cfg(feature = "qdrant")]
-            Writer::Qdrant { url, api_key } => Ok(Box::new(crate::qdrant::QdrantStore::open(
+            Writer::Qdrant {
+                url,
+                api_key,
+                sparse,
+            } => Ok(Box::new(crate::qdrant::QdrantStore::open(
                 url,
                 api_key.as_deref(),
                 name,
                 embedder,
+                sparse.clone(),
             )?)),
         }
     }
 }
 
 /// Resolve the write backend from config (same compile-time/runtime contract as
-/// [`lexical_retriever`] / [`reranker`]).
-fn writer(cfg: &Config) -> Result<Writer> {
+/// [`lexical_retriever`] / [`reranker`]). `sparse` is shared with the read path so
+/// writes and queries use the same driver.
+fn writer(cfg: &Config, sparse: Option<Arc<dyn SparseEmbedder>>) -> Result<Writer> {
     match cfg.retrieval.backend.as_str() {
         "local" | "" => Ok(Writer::Local {
             cache_dir: cfg.retrieval.cache_dir.clone(),
@@ -266,10 +277,12 @@ fn writer(cfg: &Config) -> Result<Writer> {
                 Ok(Writer::Qdrant {
                     url: cfg.retrieval.qdrant_url.clone(),
                     api_key: cfg.retrieval.qdrant_api_key.clone(),
+                    sparse,
                 })
             }
             #[cfg(not(feature = "qdrant"))]
             {
+                let _ = sparse;
                 anyhow::bail!("ENKI_BACKEND=qdrant but the `qdrant` feature is not compiled in")
             }
         }
@@ -277,21 +290,60 @@ fn writer(cfg: &Config) -> Result<Writer> {
     }
 }
 
-/// Build the read-side collections for the configured backend.
-async fn build_collections(cfg: &Config) -> Result<Vec<Collection>> {
+/// Build the read-side collections for the configured backend. `sparse` is used
+/// only by the Qdrant hybrid path.
+async fn build_collections(
+    cfg: &Config,
+    sparse: Option<Arc<dyn SparseEmbedder>>,
+) -> Result<Vec<Collection>> {
     match cfg.retrieval.backend.as_str() {
         "local" | "" => build_local_collections(cfg),
         "qdrant" => {
             #[cfg(feature = "qdrant")]
             {
-                build_qdrant_collections(cfg).await
+                build_qdrant_collections(cfg, sparse).await
             }
             #[cfg(not(feature = "qdrant"))]
             {
+                let _ = sparse;
                 anyhow::bail!("ENKI_BACKEND=qdrant but the `qdrant` feature is not compiled in")
             }
         }
         other => anyhow::bail!("unknown ENKI_BACKEND `{other}` (expected `local` or `qdrant`)"),
+    }
+}
+
+/// Resolve the configured sparse driver (Qdrant hybrid). `none` → dense-only;
+/// `hashed` (zero-dep) is always available; `fastembed` needs the feature.
+fn sparse_embedder(cfg: &Config) -> Result<Option<Arc<dyn SparseEmbedder>>> {
+    match cfg.retrieval.sparse.as_str() {
+        "none" | "" => Ok(None),
+        "hashed" => Ok(Some(Arc::new(crate::sparse::HashedTfSparse::new()))),
+        "fastembed" => {
+            #[cfg(feature = "fastembed")]
+            {
+                let model = match cfg.retrieval.sparse_model.as_str() {
+                    "splade" => fastembed::SparseModel::SPLADEPPV1,
+                    _ => fastembed::SparseModel::BGEM3,
+                };
+                let s = crate::sparse::FastembedSparse::open(
+                    model,
+                    cfg.retrieval.rerank_cache.clone(),
+                )?;
+                Ok(Some(Arc::new(s) as Arc<dyn SparseEmbedder>))
+            }
+            #[cfg(not(feature = "fastembed"))]
+            {
+                anyhow::bail!(
+                    "ENKI_SPARSE=fastembed but the `fastembed` feature is not compiled in"
+                )
+            }
+        }
+        other => {
+            anyhow::bail!(
+                "unknown ENKI_SPARSE driver `{other}` (expected `none`, `hashed` or `fastembed`)"
+            )
+        }
     }
 }
 
@@ -325,13 +377,18 @@ fn build_local_collections(cfg: &Config) -> Result<Vec<Collection>> {
     Ok(collections)
 }
 
-/// Qdrant profile: one dense retriever per collection that exists on the server.
-/// Dense-only, so lexical (tantivy) is rejected here.
+/// Qdrant profile: one retriever per collection that exists on the server — dense,
+/// or hybrid (dense + sparse, server-side fusion) when a sparse driver is set.
+/// Lexical (tantivy) is a local-file index, so it is rejected here; use `ENKI_SPARSE`
+/// for Qdrant-side lexical instead.
 #[cfg(feature = "qdrant")]
-async fn build_qdrant_collections(cfg: &Config) -> Result<Vec<Collection>> {
+async fn build_qdrant_collections(
+    cfg: &Config,
+    sparse: Option<Arc<dyn SparseEmbedder>>,
+) -> Result<Vec<Collection>> {
     if !matches!(cfg.retrieval.lexical.as_str(), "none" | "") {
         anyhow::bail!(
-            "ENKI_LEXICAL={} is incompatible with ENKI_BACKEND=qdrant (dense-only for now)",
+            "ENKI_LEXICAL={} is incompatible with ENKI_BACKEND=qdrant — use ENKI_SPARSE for Qdrant-side lexical",
             cfg.retrieval.lexical
         );
     }
@@ -339,14 +396,23 @@ async fn build_qdrant_collections(cfg: &Config) -> Result<Vec<Collection>> {
         &cfg.retrieval.qdrant_url,
         cfg.retrieval.qdrant_api_key.as_deref(),
     )?);
+    let fusion = crate::qdrant::fusion_from_str(&cfg.retrieval.qdrant_fusion)?;
 
-    let make = |name: &str, tier| Collection {
-        name: name.to_string(),
-        tier,
-        retrievers: vec![
-            Arc::new(crate::qdrant::QdrantRetriever::new(client.clone(), name))
-                as Arc<dyn Retriever>,
-        ],
+    let make = |name: &str, tier| {
+        let retriever: Arc<dyn Retriever> = match &sparse {
+            Some(s) => Arc::new(crate::qdrant::QdrantRetriever::hybrid(
+                client.clone(),
+                name,
+                s.clone(),
+                fusion,
+            )),
+            None => Arc::new(crate::qdrant::QdrantRetriever::dense(client.clone(), name)),
+        };
+        Collection {
+            name: name.to_string(),
+            tier,
+            retrievers: vec![retriever],
+        }
     };
 
     anyhow::ensure!(

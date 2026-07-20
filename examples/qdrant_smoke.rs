@@ -25,6 +25,7 @@ async fn main() -> anyhow::Result<()> {
     use enki::model::{Document, Metadata, TrustStatus};
     use enki::providers;
     use enki::qdrant::QdrantStore;
+    use enki::sparse::{HashedTfSparse, SparseEmbedder};
     use enki::store::Index;
     use std::sync::Arc;
 
@@ -33,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut cfg = Config::from_env();
     cfg.retrieval.backend = "qdrant".into(); // force the backend for the demo
+    cfg.retrieval.sparse = "hashed".into(); // hybrid: dense + zero-dep hashed sparse
 
     let doc = |id: &str, label: &str, content: &str| Document {
         id: id.into(),
@@ -54,11 +56,13 @@ async fn main() -> anyhow::Result<()> {
         ),
         cfg.embed.model.clone(),
     ));
+    let sparse: Arc<dyn SparseEmbedder> = Arc::new(HashedTfSparse::new());
     let mut store = QdrantStore::open(
         &cfg.retrieval.qdrant_url,
         cfg.retrieval.qdrant_api_key.as_deref(),
         "corpus",
         embedder,
+        Some(sparse),
     )?;
     store
         .upsert(vec![

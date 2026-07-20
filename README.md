@@ -232,8 +232,8 @@ All config is environment-driven (loaded from `.env` if present). See
 `ENKI_EMBED_ENDPOINT`, `ENKI_EMBED_API_KEY`, `ENKI_MANIFEST`, `ENKI_LIBRARY_SCOPE`,
 `ENKI_TOP_K`,
 `ENKI_MAX_ROUNDS`, `ENKI_BACKEND`, `ENKI_CACHE_DIR`, `ENKI_QDRANT_URL`,
-`ENKI_QDRANT_API_KEY`, `ENKI_LEXICAL`, `ENKI_RERANK`, `ENKI_RERANK_CACHE`,
-`ENKI_LOG`.
+`ENKI_QDRANT_API_KEY`, `ENKI_SPARSE`, `ENKI_SPARSE_MODEL`, `ENKI_QDRANT_FUSION`,
+`ENKI_LEXICAL`, `ENKI_RERANK`, `ENKI_RERANK_CACHE`, `ENKI_LOG`.
 
 `Config` is **grouped by concern** — `embed`, `llm`, `retrieval`, `agent`,
 `indexing` — so each part of the code (and each consumer) depends only on what it
@@ -275,8 +275,7 @@ ENKI_LLM_PROVIDER=gemini ENKI_LLM_MODEL=gemini-2.5-flash ENKI_LLM_API_KEY=… \
   embedded desktop app. Persisted under `ENKI_CACHE_DIR`.
 - `qdrant` (feature `qdrant`): a [Qdrant] server. HNSW retrieval with `trust_min`
   pushed down as a server-side filter, and `ingest` / `delete` write straight to
-  it. Dense-only for now — the engine's fusion/rerank sits on top unchanged, so
-  native hybrid can slot in later without touching it.
+  it. Dense, or **hybrid** (dense + sparse) — see below.
 
 ```bash
 ENKI_BACKEND=qdrant ENKI_QDRANT_URL=http://localhost:6334 \
@@ -285,7 +284,23 @@ ENKI_BACKEND=qdrant ENKI_QDRANT_URL=http://localhost:6334 \
 
 `ENKI_QDRANT_API_KEY` is injected via config (Qdrant Cloud); `None` for a local
 instance. `tantivy` is a local-file index, so it is rejected with the `qdrant`
-backend.
+backend — use `ENKI_SPARSE` for Qdrant-side lexical.
+
+**Hybrid (dense + sparse).** `ENKI_SPARSE` adds a sparse (lexical) vector fused
+with the dense one **server-side** (`ENKI_QDRANT_FUSION=rrf|dbsf`), in one Query
+API call. To the engine it is still a single `Hybrid` source, so fusion/rerank
+above are untouched. The collection is created with named `dense` + `sparse`
+vectors (`Modifier::Idf`) — switching a dense-only collection to hybrid needs a
+reindex. Two drivers, both behind the public `SparseEmbedder` trait (bring your
+own via `Library::builder`):
+
+- `hashed` — zero-dep, offline, model-free: hashed term-frequencies + server-side
+  IDF (BM25-ish). Multilingual, wasm-safe, no ONNX. The lightweight default.
+- `fastembed` (feature `fastembed`) — a learned sparse model: `bge-m3`
+  (multilingual, same family as the dense bge-m3) or `splade` (English).
+
+The right sparse model depends on **your** corpus and language — the library ships
+the mechanism and two drivers, not an opinion. Measure with `retrieval_eval`.
 
 ### Search backends
 
@@ -338,7 +353,8 @@ directory. See `SPEC.md` for the manifest format.
 - [x] Example producers: manifest (corpus), campaign vault (instance), per-spell SRD (spells)
 - [ ] Outline graph navigation (`open` / `neighbors`)
 - [x] Qdrant store backend — dense retrieval + write (feature `qdrant`, `ENKI_BACKEND`)
-- [ ] Qdrant native hybrid (sparse/SPLADE dense+sparse fusion)
+- [x] Qdrant native hybrid — dense + sparse, server-side fusion (`ENKI_SPARSE`); two
+  drivers behind `SparseEmbedder`: hashed-TF (zero-dep) + fastembed (bge-m3/SPLADE)
 - [x] Multi-provider LLM (Ollama / Gemini / OpenAI / Anthropic via genai routing)
 - [x] Prompt caching (ephemeral CacheControl) on the stable system+tools prefix
 
