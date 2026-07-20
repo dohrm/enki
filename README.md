@@ -134,7 +134,7 @@ chosen at runtime (see below).
 Use it directly, without the agent — raw ranked passages for your own harness:
 
 ```rust
-let library = Library::open(&config)?;
+let library = Library::open(&config).await?;
 for Scored { chunk, score } in library.search("your query", 8).await? {
     println!("{score:.3}  [tier {}]  {}", chunk.tier, chunk.provenance.label);
 }
@@ -157,7 +157,7 @@ the matching endpoint/credentials.
 ### As a library
 
 ```rust
-let library = enki::library::Library::open(&config)?;   // hides all the wiring
+let library = enki::library::Library::open(&config).await?;   // hides all the wiring
 
 let answer = library.ask("How does a dice roll work?").await?;
 println!("{}", answer.markdown);                         // grounded, with [n] markers
@@ -231,8 +231,9 @@ All config is environment-driven (loaded from `.env` if present). See
 `ENKI_LLM_ENDPOINT`, `ENKI_LLM_API_KEY`, `ENKI_EMBED_PROVIDER`, `ENKI_EMBED_MODEL`,
 `ENKI_EMBED_ENDPOINT`, `ENKI_EMBED_API_KEY`, `ENKI_MANIFEST`, `ENKI_LIBRARY_SCOPE`,
 `ENKI_TOP_K`,
-`ENKI_MAX_ROUNDS`, `ENKI_CACHE_DIR`, `ENKI_LEXICAL`, `ENKI_RERANK`,
-`ENKI_RERANK_CACHE`, `ENKI_LOG`.
+`ENKI_MAX_ROUNDS`, `ENKI_BACKEND`, `ENKI_CACHE_DIR`, `ENKI_QDRANT_URL`,
+`ENKI_QDRANT_API_KEY`, `ENKI_LEXICAL`, `ENKI_RERANK`, `ENKI_RERANK_CACHE`,
+`ENKI_LOG`.
 
 `Config` is **grouped by concern** — `embed`, `llm`, `retrieval`, `agent`,
 `indexing` — so each part of the code (and each consumer) depends only on what it
@@ -257,7 +258,7 @@ let mut cfg = Config::from_env();
 cfg.llm.provider = "gemini".into();
 cfg.llm.model = "gemini-2.5-flash".into();
 cfg.llm.api_key = Some(user_settings.gemini_key);   // from the app, not the env
-let library = Library::open(&cfg)?;
+let library = Library::open(&cfg).await?;
 ```
 
 ```bash
@@ -265,6 +266,26 @@ let library = Library::open(&cfg)?;
 ENKI_LLM_PROVIDER=gemini ENKI_LLM_MODEL=gemini-2.5-flash ENKI_LLM_API_KEY=… \
   cargo run -- ask "..."   # embedder stays ENKI_EMBED_PROVIDER=ollama / bge-m3
 ```
+
+### Store backend (local · Qdrant)
+
+`ENKI_BACKEND` picks where vectors live — the read *and* write path:
+
+- `local` (default): on-disk vectors + brute-force scan. Zero infra; ideal for an
+  embedded desktop app. Persisted under `ENKI_CACHE_DIR`.
+- `qdrant` (feature `qdrant`): a [Qdrant] server. HNSW retrieval with `trust_min`
+  pushed down as a server-side filter, and `ingest` / `delete` write straight to
+  it. Dense-only for now — the engine's fusion/rerank sits on top unchanged, so
+  native hybrid can slot in later without touching it.
+
+```bash
+ENKI_BACKEND=qdrant ENKI_QDRANT_URL=http://localhost:6334 \
+  cargo run --example qdrant_smoke --features qdrant     # ingest → search → ask
+```
+
+`ENKI_QDRANT_API_KEY` is injected via config (Qdrant Cloud); `None` for a local
+instance. `tantivy` is a local-file index, so it is rejected with the `qdrant`
+backend.
 
 ### Search backends
 
@@ -316,7 +337,8 @@ directory. See `SPEC.md` for the manifest format.
 - [x] Agentic-loop robustness (stale/dup guard, no-blank fallback, budget cap)
 - [x] Example producers: manifest (corpus), campaign vault (instance), per-spell SRD (spells)
 - [ ] Outline graph navigation (`open` / `neighbors`)
-- [ ] Multiple tiers/collections + Qdrant backend
+- [x] Qdrant store backend — dense retrieval + write (feature `qdrant`, `ENKI_BACKEND`)
+- [ ] Qdrant native hybrid (sparse/SPLADE dense+sparse fusion)
 - [x] Multi-provider LLM (Ollama / Gemini / OpenAI / Anthropic via genai routing)
 - [x] Prompt caching (ephemeral CacheControl) on the stable system+tools prefix
 
@@ -336,3 +358,4 @@ lefthook install
 
 [genai]: https://github.com/jeremychone/rust-genai
 [lefthook]: https://github.com/evilmartians/lefthook
+[Qdrant]: https://qdrant.tech/

@@ -4,6 +4,11 @@
 
 [advisories]
 version = 2
+ignore = [
+    # `paste` is unmaintained (not a vulnerability). Pulled transitively by genai;
+    # no safe upgrade exists yet. Revisit when genai drops it.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2
@@ -24,6 +29,14 @@ allow = [
     "BSL-1.0",
     "CDLA-Permissive-2.0",
 ]
+
+# MPL-2.0 is file-level copyleft: using it as an unmodified dependency puts no
+# obligation on our code. Allowed surgically for the crates that carry it, rather
+# than opening MPL-2.0 crate-wide.
+#   option-ext ← fastembed → hf-hub → dirs → dirs-sys   (feature `fastembed`)
+[[licenses.exceptions]]
+name = "option-ext"
+allow = ["MPL-2.0"]
 
 [bans]
 multiple-versions = "warn"

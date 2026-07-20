@@ -115,7 +115,9 @@ async fn main() -> Result<()> {
     let raw = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
     let cases: Vec<EvalCase> = serde_json::from_str(&raw).context("parsing question set")?;
 
-    let library = Library::open(&cfg).context("opening library (build index + ingest first)")?;
+    let library = Library::open(&cfg)
+        .await
+        .context("opening library (build index + ingest first)")?;
 
     println!("# Enki retrieval eval (no LLM)");
     println!("- lexical : {lexical}");

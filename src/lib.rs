@@ -17,6 +17,8 @@ pub mod library;
 pub mod model;
 pub mod prompt;
 pub mod providers;
+#[cfg(feature = "qdrant")]
+pub mod qdrant;
 pub mod registry;
 #[cfg(feature = "fastembed")]
 pub mod rerank;

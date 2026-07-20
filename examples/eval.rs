@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
     let raw = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
     let cases: Vec<EvalCase> = serde_json::from_str(&raw).context("parsing question set")?;
 
-    let library = Library::open(&cfg).context(
+    let library = Library::open(&cfg).await.context(
         "opening library — did you build the index and ingest the campaign? (see the header)",
     )?;
 

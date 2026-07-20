@@ -67,7 +67,7 @@ async fn run_index(cfg: &Config) -> Result<()> {
 
 async fn run_ask(cfg: &Config, question: &str) -> Result<()> {
     let question = question_or_default(question);
-    let library = Library::open(cfg)?;
+    let library = Library::open(cfg).await?;
     println!(
         "\n> {question}  ({} collection(s))\n",
         library.collection_count()
@@ -81,7 +81,7 @@ async fn run_ask(cfg: &Config, question: &str) -> Result<()> {
 
 async fn run_stream(cfg: &Config, question: &str) -> Result<()> {
     let question = question_or_default(question);
-    let library = Library::open(cfg)?;
+    let library = Library::open(cfg).await?;
     println!(
         "\n> {question}  ({} collection(s))\n",
         library.collection_count()

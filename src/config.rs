@@ -54,26 +54,40 @@ pub type LlmConfig = ProviderConfig;
 /// Everything to build and query the search engine — no LLM involved.
 #[derive(Debug, Clone)]
 pub struct RetrievalConfig {
-    /// Where collections are persisted (and read from). Shared with indexing.
+    /// Store backend: `local` (on-disk vectors + brute-force) or `qdrant` (a
+    /// Qdrant server, needs the `qdrant` feature). Selected at runtime.
+    pub backend: String,
+    /// Where collections are persisted (and read from) in the `local` backend.
+    /// Shared with indexing.
     pub cache_dir: PathBuf,
     /// Passages returned per search.
     pub top_k: usize,
     /// Lexical backend: `none` or `tantivy` (needs the `tantivy` feature).
+    /// Local-only for now — incompatible with the `qdrant` backend.
     pub lexical: String,
     /// Reranker backend: `none` or `fastembed` (needs the `fastembed` feature).
+    /// Applies to any store backend.
     pub rerank: String,
     /// Optional cache dir for the reranker model (reuse a host app's download).
     pub rerank_cache: Option<PathBuf>,
+    /// Qdrant gRPC endpoint (used only when `backend = qdrant`).
+    pub qdrant_url: String,
+    /// Optional Qdrant API key, injected by the caller (Qdrant Cloud). `None` for
+    /// a local/unsecured instance.
+    pub qdrant_api_key: Option<String>,
 }
 
 impl RetrievalConfig {
     pub fn from_env() -> Self {
         Self {
+            backend: env_or("ENKI_BACKEND", "local"),
             cache_dir: env_or("ENKI_CACHE_DIR", ".cache").into(),
             top_k: env_or("ENKI_TOP_K", "5").parse().unwrap_or(5),
             lexical: env_or("ENKI_LEXICAL", "none"),
             rerank: env_or("ENKI_RERANK", "none"),
             rerank_cache: env_opt("ENKI_RERANK_CACHE").map(Into::into),
+            qdrant_url: env_or("ENKI_QDRANT_URL", "http://localhost:6334"),
+            qdrant_api_key: env_opt("ENKI_QDRANT_API_KEY"),
         }
     }
 }

@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "What is this library about?".to_string());
 
     // The whole wiring — store, search engine, LLM, prompt — is behind `open`.
-    let library = Library::open(&cfg)?;
+    let library = Library::open(&cfg).await?;
     let answer = library.ask(&question).await?;
 
     println!("{}\n", answer.markdown);

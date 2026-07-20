@@ -40,9 +40,10 @@ tantivy = ["dep:tantivy"]
 # stage that reorders the fused candidates. Selected by `ENKI_RERANK=fastembed`.
 # Pulls onnxruntime — heavy; keep off unless reranking is wanted.
 fastembed = ["dep:fastembed"]
-# Planned backends (compile-time). Runtime selection stays config-driven; the
-# engine resolver errors if config asks for a backend not compiled in.
-#   qdrant  = ["dep:qdrant-client"]  # hybrid dense+sparse backend
+# `qdrant`: a Qdrant server as the store backend (write + dense retrieval),
+# selected at runtime by `ENKI_BACKEND=qdrant`. Dense-only for now; the engine's
+# fusion/rerank sits on top unchanged, leaving room for native hybrid later.
+qdrant = ["dep:qdrant-client", "dep:uuid"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
@@ -60,6 +61,8 @@ tantivy = { version = "0.24", optional = true }
 fastembed = { version = "5", optional = true }
 memmap2 = { version = "0.9", optional = true }
 bytemuck = { version = "1", optional = true }
+qdrant-client = { version = "1", optional = true }
+uuid = { version = "1", features = ["v5"], optional = true }
 
 # Demo producers (examples/) only — kept out of the library's dependencies.
 [dev-dependencies]

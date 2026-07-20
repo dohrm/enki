@@ -3,6 +3,11 @@
 //! `delete` to manage living content. All the wiring (store, engine, LLM, prompt)
 //! is hidden by [`Library::open`] — or bring your own via [`Library::builder`]
 //! (custom embedder, custom collections, any genai client).
+//!
+//! The store backend is chosen at open time from config (`ENKI_BACKEND`): `local`
+//! (on-disk vectors + brute-force, zero infra) or `qdrant` (a Qdrant server, both
+//! read and write). Retrieval, fusion and rerank are backend-agnostic above the
+//! [`Retriever`] seam.
 
 use crate::agent::{self, AgentEvent, Answer};
 use crate::config::Config;
@@ -24,18 +29,21 @@ pub struct Library {
     model: String,
     system: String,
     engine: Arc<SearchEngine>,
-    cache_dir: PathBuf,
     /// Shared by the query path (engine) and the write path (`ingest` / `delete`).
     embedder: Arc<dyn Embedder>,
     top_k: usize,
     max_rounds: usize,
+    /// Where `ingest` / `delete` write — the counterpart of the read backend.
+    writer: Writer,
 }
 
 impl Library {
-    /// Open a library from config: load the persisted collections (`corpus`
-    /// required; `spells` / `instance` added when present), wire the search engine
-    /// and LLM. Uses the genai embedder/LLM described by `cfg`.
-    pub fn open(cfg: &Config) -> Result<Self> {
+    /// Open a library from config: wire the configured store backend, the search
+    /// engine and the LLM. For `local`, load the persisted collections (`corpus`
+    /// required; `spells` / `instance` added when present); for `qdrant`, connect
+    /// and register the collections that exist on the server. Async because a
+    /// remote backend is reached during open.
+    pub async fn open(cfg: &Config) -> Result<Self> {
         let embedder: Arc<dyn Embedder> = Arc::new(GenaiEmbedder::new(
             providers::client(
                 &cfg.embed.provider,
@@ -45,34 +53,7 @@ impl Library {
             cfg.embed.model.clone(),
         ));
 
-        // Build a collection: dense (brute-force) + optional lexical (BM25), fused
-        // by the engine's modality RRF. `corpus` is required; the others are
-        // loaded when their store exists.
-        let build = |store: VectorStore, name: &str, tier| -> Result<Collection> {
-            let mut retrievers: Vec<Arc<dyn Retriever>> = vec![Arc::new(BruteForce::new(store))];
-            if let Some(lex) = lexical_retriever(cfg, name)? {
-                retrievers.push(lex);
-            }
-            Ok(Collection {
-                name: name.to_string(),
-                tier,
-                retrievers,
-            })
-        };
-
-        let mut collections = vec![build(
-            VectorStore::open(&cfg.retrieval.cache_dir, "corpus")?,
-            "corpus",
-            0,
-        )?];
-        // Optional collections: `spells` (finer book chunks, tier 0), `instance`
-        // (living campaign content, tier 1).
-        for (name, tier) in [("spells", 0), ("instance", 1)] {
-            if let Ok(store) = VectorStore::open(&cfg.retrieval.cache_dir, name) {
-                collections.push(build(store, name, tier)?);
-            }
-        }
-
+        let collections = build_collections(cfg).await?;
         let mut engine = SearchEngine::new(embedder.clone(), collections);
         if let Some(reranker) = reranker(cfg)? {
             engine = engine.with_reranker(reranker);
@@ -87,10 +68,10 @@ impl Library {
             model: cfg.llm.model.clone(),
             system: prompt::system_prompt(&cfg.agent.scope, cfg.agent.max_rounds),
             engine: Arc::new(engine),
-            cache_dir: cfg.retrieval.cache_dir.clone(),
             embedder,
             top_k: cfg.retrieval.top_k,
             max_rounds: cfg.agent.max_rounds,
+            writer: writer(cfg)?,
         })
     }
 
@@ -98,6 +79,7 @@ impl Library {
     /// fastembed), a hand-built [`SearchEngine`] (custom collections / tiers /
     /// retrievers), and any genai [`Client`]. The escape hatch from the
     /// opinionated [`Library::open`], keeping `ask` / `stream` / `ingest`.
+    /// The write path (`ingest` / `delete`) targets the local `cache_dir`.
     pub fn builder(
         engine: Arc<SearchEngine>,
         embedder: Arc<dyn Embedder>,
@@ -177,14 +159,14 @@ impl Library {
 
     /// Ingest living content into a collection (upsert, idempotent by doc id).
     pub async fn ingest(&self, collection: &str, docs: Vec<Document>) -> Result<()> {
-        let mut store = LocalStore::open(&self.cache_dir, collection, self.embedder.clone());
+        let mut store = self.writer.open_index(collection, self.embedder.clone())?;
         store.upsert(docs).await
     }
 
     /// Remove documents (by id) from a collection — the write-side counterpart of
     /// [`Library::ingest`].
     pub async fn delete(&self, collection: &str, doc_ids: &[String]) -> Result<()> {
-        let mut store = LocalStore::open(&self.cache_dir, collection, self.embedder.clone());
+        let mut store = self.writer.open_index(collection, self.embedder.clone())?;
         store.delete(doc_ids).await
     }
 }
@@ -208,7 +190,7 @@ impl LibraryBuilder {
         self.system = system.into();
         self
     }
-    /// Where `ingest` / `delete` persist collections. Default: `.cache`.
+    /// Where `ingest` / `delete` persist collections (local backend). Default: `.cache`.
     pub fn cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cache_dir = dir.into();
         self
@@ -229,12 +211,156 @@ impl LibraryBuilder {
             model: self.model,
             system: self.system,
             engine: self.engine,
-            cache_dir: self.cache_dir,
             embedder: self.embedder,
             top_k: self.top_k,
             max_rounds: self.max_rounds,
+            writer: Writer::Local {
+                cache_dir: self.cache_dir,
+            },
         }
     }
+}
+
+// ---------- Store backend selection (runtime config + compile-time features) ----------
+
+/// The write target for `ingest` / `delete`. Mirrors the read backend chosen at
+/// [`Library::open`]; each variant knows how to open an [`Index`] for a collection.
+enum Writer {
+    Local {
+        cache_dir: PathBuf,
+    },
+    #[cfg(feature = "qdrant")]
+    Qdrant {
+        url: String,
+        api_key: Option<String>,
+    },
+}
+
+impl Writer {
+    fn open_index(&self, name: &str, embedder: Arc<dyn Embedder>) -> Result<Box<dyn Index>> {
+        match self {
+            Writer::Local { cache_dir } => {
+                Ok(Box::new(LocalStore::open(cache_dir, name, embedder)))
+            }
+            #[cfg(feature = "qdrant")]
+            Writer::Qdrant { url, api_key } => Ok(Box::new(crate::qdrant::QdrantStore::open(
+                url,
+                api_key.as_deref(),
+                name,
+                embedder,
+            )?)),
+        }
+    }
+}
+
+/// Resolve the write backend from config (same compile-time/runtime contract as
+/// [`lexical_retriever`] / [`reranker`]).
+fn writer(cfg: &Config) -> Result<Writer> {
+    match cfg.retrieval.backend.as_str() {
+        "local" | "" => Ok(Writer::Local {
+            cache_dir: cfg.retrieval.cache_dir.clone(),
+        }),
+        "qdrant" => {
+            #[cfg(feature = "qdrant")]
+            {
+                Ok(Writer::Qdrant {
+                    url: cfg.retrieval.qdrant_url.clone(),
+                    api_key: cfg.retrieval.qdrant_api_key.clone(),
+                })
+            }
+            #[cfg(not(feature = "qdrant"))]
+            {
+                anyhow::bail!("ENKI_BACKEND=qdrant but the `qdrant` feature is not compiled in")
+            }
+        }
+        other => anyhow::bail!("unknown ENKI_BACKEND `{other}` (expected `local` or `qdrant`)"),
+    }
+}
+
+/// Build the read-side collections for the configured backend.
+async fn build_collections(cfg: &Config) -> Result<Vec<Collection>> {
+    match cfg.retrieval.backend.as_str() {
+        "local" | "" => build_local_collections(cfg),
+        "qdrant" => {
+            #[cfg(feature = "qdrant")]
+            {
+                build_qdrant_collections(cfg).await
+            }
+            #[cfg(not(feature = "qdrant"))]
+            {
+                anyhow::bail!("ENKI_BACKEND=qdrant but the `qdrant` feature is not compiled in")
+            }
+        }
+        other => anyhow::bail!("unknown ENKI_BACKEND `{other}` (expected `local` or `qdrant`)"),
+    }
+}
+
+/// Local profile: dense (brute-force) + optional lexical (BM25), fused by the
+/// engine's modality RRF. `corpus` is required; the others load when present.
+fn build_local_collections(cfg: &Config) -> Result<Vec<Collection>> {
+    let build = |store: VectorStore, name: &str, tier| -> Result<Collection> {
+        let mut retrievers: Vec<Arc<dyn Retriever>> = vec![Arc::new(BruteForce::new(store))];
+        if let Some(lex) = lexical_retriever(cfg, name)? {
+            retrievers.push(lex);
+        }
+        Ok(Collection {
+            name: name.to_string(),
+            tier,
+            retrievers,
+        })
+    };
+
+    let mut collections = vec![build(
+        VectorStore::open(&cfg.retrieval.cache_dir, "corpus")?,
+        "corpus",
+        0,
+    )?];
+    // Optional collections: `spells` (finer book chunks, tier 0), `instance`
+    // (living campaign content, tier 1).
+    for (name, tier) in [("spells", 0), ("instance", 1)] {
+        if let Ok(store) = VectorStore::open(&cfg.retrieval.cache_dir, name) {
+            collections.push(build(store, name, tier)?);
+        }
+    }
+    Ok(collections)
+}
+
+/// Qdrant profile: one dense retriever per collection that exists on the server.
+/// Dense-only, so lexical (tantivy) is rejected here.
+#[cfg(feature = "qdrant")]
+async fn build_qdrant_collections(cfg: &Config) -> Result<Vec<Collection>> {
+    if !matches!(cfg.retrieval.lexical.as_str(), "none" | "") {
+        anyhow::bail!(
+            "ENKI_LEXICAL={} is incompatible with ENKI_BACKEND=qdrant (dense-only for now)",
+            cfg.retrieval.lexical
+        );
+    }
+    let client = Arc::new(crate::qdrant::connect(
+        &cfg.retrieval.qdrant_url,
+        cfg.retrieval.qdrant_api_key.as_deref(),
+    )?);
+
+    let make = |name: &str, tier| Collection {
+        name: name.to_string(),
+        tier,
+        retrievers: vec![
+            Arc::new(crate::qdrant::QdrantRetriever::new(client.clone(), name))
+                as Arc<dyn Retriever>,
+        ],
+    };
+
+    anyhow::ensure!(
+        client.collection_exists("corpus").await?,
+        "Qdrant collection `corpus` not found at {} — ingest first",
+        cfg.retrieval.qdrant_url
+    );
+    let mut collections = vec![make("corpus", 0)];
+    for (name, tier) in [("spells", 0), ("instance", 1)] {
+        if client.collection_exists(name).await? {
+            collections.push(make(name, tier));
+        }
+    }
+    Ok(collections)
 }
 
 /// Resolve the configured lexical backend for a collection. Runtime selection

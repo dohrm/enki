@@ -15,6 +15,11 @@ mod vector;
 pub use local::LocalStore;
 pub use vector::VectorStore;
 
+// Chunking is shared by every write backend (local files, Qdrant, …). The local
+// store reaches it directly; other backends use this re-export.
+#[cfg(feature = "qdrant")]
+pub(crate) use chunk::chunk_document;
+
 use crate::model::{Chunk, Document};
 use anyhow::Result;
 use async_trait::async_trait;
